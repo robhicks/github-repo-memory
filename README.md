@@ -14,7 +14,7 @@ An MCP (Model Context Protocol) server that builds a knowledge graph of your Git
 ## Prerequisites
 
 - Rust (edition 2021+)
-- Docker (for FalkorDB)
+- Docker or Podman componse (for FalkorDB)
 - A GitHub org to ingest
 - `gh` CLI (if using `gh_cli` auth mode)
 
