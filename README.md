@@ -24,6 +24,8 @@ An MCP (Model Context Protocol) server that builds a knowledge graph of your Git
 
 ```bash
 docker compose up -d
+# or
+podman compose up -d
 ```
 
 **2. Configure environment variables** (or create a `.env` file):
@@ -157,4 +159,4 @@ cargo test --lib client      # FalkorDB param tests only
 
 ## License
 
-All rights reserved.
+[MIT](LICENSE)
