@@ -20,55 +20,110 @@ pub struct AuthState {
 
 /// Axum middleware that validates OAuth 2 bearer tokens.
 ///
-/// In `GitHub` mode, checks the token against the in-memory TokenStore
-/// (tokens were validated against GitHub API during the OAuth callback).
-///
-/// In `JWT` mode, validates the JWT signature and claims.
+/// Returns MCP-spec compliant 401 responses with WWW-Authenticate headers
+/// that include the resource_metadata URL so MCP clients can discover
+/// the OAuth endpoints via RFC 9728.
 pub async fn require_auth(
     State(auth): State<Arc<AuthState>>,
     request: Request,
     next: Next,
 ) -> Result<Response, Response> {
+    // Derive the resource metadata URL from the request
+    let resource_metadata_url = derive_resource_metadata_url(&request);
+
     let auth_header = request
         .headers()
         .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| unauthorized("Missing Authorization header"))?;
+        .and_then(|v| v.to_str().ok());
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| unauthorized("Authorization header must use Bearer scheme"))?;
+    let auth_header = match auth_header {
+        Some(h) => h,
+        None => return Err(unauthorized_with_discovery(&resource_metadata_url, None)),
+    };
+
+    let token = match auth_header.strip_prefix("Bearer ") {
+        Some(t) => t,
+        None => {
+            return Err(unauthorized_with_discovery(
+                &resource_metadata_url,
+                Some("invalid_request"),
+            ))
+        }
+    };
 
     match auth.auth_mode {
         AuthMode::GitHub => {
-            auth.token_store
-                .get(token)
-                .ok_or_else(|| unauthorized("Invalid or expired token"))?;
+            if auth.token_store.get(token).is_none() {
+                return Err(unauthorized_with_discovery(
+                    &resource_metadata_url,
+                    Some("invalid_token"),
+                ));
+            }
         }
         AuthMode::Jwt => {
-            validate_jwt(token, &auth)?;
+            validate_jwt(token, &auth).map_err(|_| {
+                unauthorized_with_discovery(&resource_metadata_url, Some("invalid_token"))
+            })?;
         }
     }
 
     Ok(next.run(request).await)
 }
 
-fn validate_jwt(token: &str, auth: &AuthState) -> Result<(), Response> {
-    let secret = auth
-        .jwt_secret
-        .as_ref()
-        .ok_or_else(|| unauthorized("Server misconfigured: missing JWT secret"))?;
+fn validate_jwt(token: &str, auth: &AuthState) -> Result<(), ()> {
+    let secret = auth.jwt_secret.as_ref().ok_or(())?;
 
     let validation = jsonwebtoken::Validation::default();
     let key = jsonwebtoken::DecodingKey::from_secret(secret.as_bytes());
 
-    jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
-        .map_err(|e| unauthorized(&format!("Invalid JWT: {e}")))?;
+    jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation).map_err(|_| ())?;
 
     Ok(())
 }
 
-fn unauthorized(message: &str) -> Response {
-    let body = serde_json::json!({ "error": message });
-    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+/// Build a 401 response with WWW-Authenticate header per MCP spec.
+///
+/// The header includes `resource_metadata` pointing to the
+/// `/.well-known/oauth-protected-resource` endpoint so MCP clients
+/// can discover OAuth endpoints via RFC 9728.
+fn unauthorized_with_discovery(resource_metadata_url: &str, error: Option<&str>) -> Response {
+    let mut www_auth = format!(
+        "Bearer resource_metadata=\"{}\"",
+        resource_metadata_url
+    );
+
+    if let Some(err) = error {
+        www_auth.push_str(&format!(", error=\"{}\"", err));
+    }
+
+    let body = serde_json::json!({
+        "error": error.unwrap_or("authorization_required"),
+        "error_description": "Bearer token required. Use the resource_metadata URL to discover OAuth endpoints."
+    });
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [("WWW-Authenticate", www_auth)],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// Derive the `/.well-known/oauth-protected-resource` URL from the request.
+fn derive_resource_metadata_url(request: &Request) -> String {
+    let host = request
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+
+    let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
+        "http"
+    } else {
+        "https"
+    };
+
+    format!(
+        "{scheme}://{host}/.well-known/oauth-protected-resource"
+    )
 }

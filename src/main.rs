@@ -8,7 +8,11 @@ mod server;
 mod tools;
 
 use anyhow::Result;
-use axum::{middleware, routing::get, Router};
+use axum::{
+    middleware,
+    routing::{get, post},
+    Router,
+};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpService,
 };
@@ -23,6 +27,13 @@ use auth::token_store::TokenStore;
 use github::client::GitHubClient;
 use graph::client::GraphClient;
 use server::CodeMemoryServer;
+
+/// Combined application state shared across all routes.
+#[derive(Clone)]
+pub struct AppState {
+    pub oauth: OAuthState,
+    pub auth: Arc<AuthState>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -45,33 +56,24 @@ async fn main() -> Result<()> {
     // Token store for OAuth (5 minute TTL for validated tokens)
     let token_store = TokenStore::new(300);
 
-    // OAuth state for GitHub auth endpoints
     let oauth_state = OAuthState {
         config: config.clone(),
         token_store: token_store.clone(),
         http_client: reqwest::Client::new(),
     };
 
-    // Auth state for MCP middleware
     let auth_state = Arc::new(AuthState {
         token_store: token_store.clone(),
         auth_mode: config.auth_mode.clone(),
         jwt_secret: config.jwt_secret.clone(),
     });
 
-    // Auth routes (unauthenticated)
-    let auth_routes = Router::new()
-        .route("/auth/github/login", get(auth::github_oauth::login))
-        .route(
-            "/auth/github/callback",
-            get(auth::github_oauth::callback),
-        )
-        .with_state(oauth_state);
+    let app_state = AppState {
+        oauth: oauth_state,
+        auth: auth_state.clone(),
+    };
 
-    // Health check (unauthenticated)
-    let health_route = Router::new().route("/health", get(|| async { "ok" }));
-
-    // MCP service factory — creates a CodeMemoryServer per session.
+    // --- MCP service ---
     let graph_for_mcp = graph.clone();
     let config_for_mcp = config.clone();
 
@@ -79,31 +81,46 @@ async fn main() -> Result<()> {
         move || {
             let graph = graph_for_mcp.clone();
             let config = config_for_mcp.clone();
-
             let github = Arc::new(
                 GitHubClient::new(&config, "placeholder")
                     .expect("Failed to create GitHub client"),
             );
-
             Ok(CodeMemoryServer::new(graph, github, config))
         },
         LocalSessionManager::default().into(),
         Default::default(),
     );
 
-    // Protected MCP route with auth middleware
-    let mcp_route = Router::new()
+    // --- Build routers separately, then combine ---
+
+    // 1. OAuth routes (unauthenticated, need AppState)
+    let oauth_router = Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(auth::github_oauth::resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(auth::github_oauth::auth_server_metadata),
+        )
+        .route("/authorize", get(auth::github_oauth::authorize))
+        .route("/callback", get(auth::github_oauth::callback))
+        .route("/token", post(auth::github_oauth::token))
+        .route("/register", post(auth::github_oauth::register))
+        .with_state(app_state);
+
+    // 2. MCP route (authenticated, no AppState needed)
+    let mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
-        .route_layer(middleware::from_fn_with_state(
+        .layer(middleware::from_fn_with_state(
             auth_state.clone(),
             require_auth,
         ));
 
-    // Combine all routes
-    let app = Router::new()
-        .merge(health_route)
-        .merge(auth_routes)
-        .merge(mcp_route);
+    // 3. Combine everything
+    let app = oauth_router
+        .route("/health", get(|| async { "ok" }))
+        .merge(mcp_router);
 
     let addr = config.server_addr();
     info!("Listening on {addr}");

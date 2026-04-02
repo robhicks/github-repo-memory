@@ -17,10 +17,17 @@ impl TokenInfo {
     }
 }
 
-/// In-memory store mapping bearer tokens to validated user info with TTL.
+#[derive(Debug, Clone)]
+struct PkceInfo {
+    challenge: String,
+    method: String,
+}
+
+/// In-memory store for validated tokens and PKCE challenges.
 #[derive(Debug, Clone)]
 pub struct TokenStore {
     tokens: Arc<DashMap<String, TokenInfo>>,
+    pkce: Arc<DashMap<String, PkceInfo>>,
     default_ttl: i64,
 }
 
@@ -28,6 +35,7 @@ impl TokenStore {
     pub fn new(default_ttl_seconds: i64) -> Self {
         Self {
             tokens: Arc::new(DashMap::new()),
+            pkce: Arc::new(DashMap::new()),
             default_ttl: default_ttl_seconds,
         }
     }
@@ -56,6 +64,12 @@ impl TokenStore {
 
     pub fn remove(&self, bearer_token: &str) {
         self.tokens.remove(bearer_token);
+    }
+
+    /// Store a PKCE challenge for later verification.
+    pub fn store_pkce(&self, state: &str, challenge: String, method: String) {
+        self.pkce
+            .insert(state.to_string(), PkceInfo { challenge, method });
     }
 
     /// Remove all expired entries.
