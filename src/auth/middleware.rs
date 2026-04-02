@@ -10,6 +10,9 @@ use std::sync::Arc;
 use crate::auth::token_store::TokenStore;
 use crate::config::AuthMode;
 
+// Note: GhCli mode bypasses this middleware entirely (no auth layer is added
+// to the MCP router in main.rs), so there is no GhCli match arm needed here.
+
 /// Shared auth state injected into the middleware via axum State.
 #[derive(Clone)]
 pub struct AuthState {
@@ -64,6 +67,10 @@ pub async fn require_auth(
             validate_jwt(token, &auth).map_err(|_| {
                 unauthorized_with_discovery(&resource_metadata_url, Some("invalid_token"))
             })?;
+        }
+        AuthMode::GhCli => {
+            // GhCli mode should not use this middleware (no auth layer in main.rs).
+            // If reached anyway, allow the request through.
         }
     }
 

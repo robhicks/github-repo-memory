@@ -6,6 +6,7 @@ use std::sync::Arc;
 pub struct TokenInfo {
     pub github_login: String,
     pub github_token: String,
+    pub hostname: String,
     pub validated_at: DateTime<Utc>,
     pub ttl_seconds: i64,
 }
@@ -41,11 +42,22 @@ impl TokenStore {
     }
 
     pub fn insert(&self, bearer_token: &str, github_login: String, github_token: String) {
+        self.insert_with_hostname(bearer_token, github_login, github_token, "github.com".to_string());
+    }
+
+    pub fn insert_with_hostname(
+        &self,
+        bearer_token: &str,
+        github_login: String,
+        github_token: String,
+        hostname: String,
+    ) {
         self.tokens.insert(
             bearer_token.to_string(),
             TokenInfo {
                 github_login,
                 github_token,
+                hostname,
                 validated_at: Utc::now(),
                 ttl_seconds: self.default_ttl,
             },
@@ -76,6 +88,16 @@ impl TokenStore {
     pub fn get_any_valid(&self) -> Option<TokenInfo> {
         for entry in self.tokens.iter() {
             if !entry.value().is_expired() {
+                return Some(entry.value().clone());
+            }
+        }
+        None
+    }
+
+    /// Return a valid token for a specific GitHub hostname.
+    pub fn get_by_hostname(&self, hostname: &str) -> Option<TokenInfo> {
+        for entry in self.tokens.iter() {
+            if !entry.value().is_expired() && entry.value().hostname == hostname {
                 return Some(entry.value().clone());
             }
         }

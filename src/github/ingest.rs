@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::config::AppConfig;
+use crate::config::OrgConfig;
 use crate::github::client::GitHubClient;
 use crate::github::parsers;
 use crate::graph::client::{FalkorParam, GraphClient};
@@ -20,29 +20,32 @@ pub struct SyncReport {
     pub errors: Vec<String>,
 }
 
-/// Ingestion pipeline: crawls GitHub and populates the FalkorDB graph.
+/// Ingestion pipeline: crawls a single GitHub org and populates the FalkorDB graph.
 pub struct Ingester {
     github: Arc<GitHubClient>,
     graph: Arc<GraphClient>,
-    config: Arc<AppConfig>,
+    org_config: OrgConfig,
+    max_file_depth: usize,
 }
 
 impl Ingester {
     pub fn new(
         github: Arc<GitHubClient>,
         graph: Arc<GraphClient>,
-        config: Arc<AppConfig>,
+        org_config: OrgConfig,
+        max_file_depth: usize,
     ) -> Self {
         Self {
             github,
             graph,
-            config,
+            org_config,
+            max_file_depth,
         }
     }
 
-    /// Full sync: re-ingest all repos from the organization.
+    /// Full sync: re-ingest all repos (or only those in the org's repo list).
     pub async fn full_sync(&self) -> Result<SyncReport> {
-        info!("Starting full sync for org: {}", self.config.github_org);
+        info!("Starting full sync for org: {}", self.org_config.org);
         let mut report = SyncReport::default();
 
         // Merge organization node
@@ -50,35 +53,22 @@ impl Ingester {
             .execute(
                 queries::MERGE_ORG,
                 &[
-                    ("login", self.config.github_org.clone().into()),
-                    ("name", self.config.github_org.clone().into()),
+                    ("login", self.org_config.org.clone().into()),
+                    ("name", self.org_config.org.clone().into()),
                     (
                         "url",
-                        format!("{}/orgs/{}", self.config.github_api_url, self.config.github_org)
+                        format!("{}/orgs/{}", self.org_config.api_url, self.org_config.org)
                             .into(),
                     ),
                 ],
             )
             .await?;
 
-        // Paginate through all repos
-        let mut page = 1u32;
-        loop {
-            let repos = self
-                .github
-                .list_repos(page, 100)
-                .await?;
-
-            if repos.is_empty() {
-                break;
-            }
-
-            for repo in &repos {
-                let repo_name = repo.name.clone();
-                match self.sync_single_repo(repo).await {
-                    Ok(_) => {
-                        report.repos_updated += 1;
-                    }
+        if !self.org_config.repos.is_empty() {
+            info!("Syncing {} specified repos", self.org_config.repos.len());
+            for repo_name in &self.org_config.repos {
+                match self.sync_repo_by_name(repo_name).await {
+                    Ok(_) => report.repos_updated += 1,
                     Err(e) => {
                         warn!("Failed to sync repo {repo_name}: {e}");
                         report.errors.push(format!("{repo_name}: {e}"));
@@ -86,11 +76,29 @@ impl Ingester {
                 }
                 report.repos_processed += 1;
             }
-
-            if repos.len() < 100 {
-                break;
+        } else {
+            let mut page = 1u32;
+            loop {
+                let repos = self.github.list_repos(page, 100).await?;
+                if repos.is_empty() {
+                    break;
+                }
+                for repo in &repos {
+                    let repo_name = repo.name.clone();
+                    match self.sync_single_repo(repo).await {
+                        Ok(_) => report.repos_updated += 1,
+                        Err(e) => {
+                            warn!("Failed to sync repo {repo_name}: {e}");
+                            report.errors.push(format!("{repo_name}: {e}"));
+                        }
+                    }
+                    report.repos_processed += 1;
+                }
+                if repos.len() < 100 {
+                    break;
+                }
+                page += 1;
             }
-            page += 1;
         }
 
         // Cross-repo dependency resolution
@@ -99,19 +107,7 @@ impl Ingester {
             .execute(queries::MERGE_CROSS_REPO_DEPENDENCY, &[])
             .await?;
 
-        // Update sync timestamp
-        self.graph
-            .execute(
-                queries::UPDATE_ORG_SYNC_TIME,
-                &[
-                    ("login", self.config.github_org.clone().into()),
-                    (
-                        "last_sync_at",
-                        chrono::Utc::now().to_rfc3339().into(),
-                    ),
-                ],
-            )
-            .await?;
+        self.update_sync_timestamp().await?;
 
         info!(
             "Full sync complete: {} repos processed, {} updated, {} errors",
@@ -123,10 +119,7 @@ impl Ingester {
 
     /// Incremental sync: only process repos updated since last sync.
     pub async fn incremental_sync(&self) -> Result<SyncReport> {
-        info!(
-            "Starting incremental sync for org: {}",
-            self.config.github_org
-        );
+        info!("Starting incremental sync for org: {}", self.org_config.org);
         let mut report = SyncReport::default();
 
         // Get last sync time from org node
@@ -134,33 +127,19 @@ impl Ingester {
             .graph
             .execute(
                 "MATCH (o:Organization {login: $login}) RETURN o.last_sync_at",
-                &[("login", self.config.github_org.clone().into())],
+                &[("login", self.org_config.org.clone().into())],
             )
             .await;
 
         let _last_sync = match result {
-            Ok(_rs) => {
-                // For first run, fall back to full sync
-                None::<String>
-            }
+            Ok(_rs) => None::<String>,
             Err(_) => None,
         };
 
-        // Paginate repos sorted by updated desc, stop when we hit old ones
-        let mut page = 1u32;
-        loop {
-            let repos = self
-                .github
-                .list_repos(page, 100)
-                .await?;
-
-            if repos.is_empty() {
-                break;
-            }
-
-            for repo in &repos {
-                let repo_name = repo.name.clone();
-                match self.sync_single_repo(repo).await {
+        if !self.org_config.repos.is_empty() {
+            info!("Incremental syncing {} specified repos", self.org_config.repos.len());
+            for repo_name in &self.org_config.repos {
+                match self.sync_repo_by_name(repo_name).await {
                     Ok(_) => report.repos_updated += 1,
                     Err(e) => {
                         warn!("Failed to sync repo {repo_name}: {e}");
@@ -169,11 +148,29 @@ impl Ingester {
                 }
                 report.repos_processed += 1;
             }
-
-            if repos.len() < 100 {
-                break;
+        } else {
+            let mut page = 1u32;
+            loop {
+                let repos = self.github.list_repos(page, 100).await?;
+                if repos.is_empty() {
+                    break;
+                }
+                for repo in &repos {
+                    let repo_name = repo.name.clone();
+                    match self.sync_single_repo(repo).await {
+                        Ok(_) => report.repos_updated += 1,
+                        Err(e) => {
+                            warn!("Failed to sync repo {repo_name}: {e}");
+                            report.errors.push(format!("{repo_name}: {e}"));
+                        }
+                    }
+                    report.repos_processed += 1;
+                }
+                if repos.len() < 100 {
+                    break;
+                }
+                page += 1;
             }
-            page += 1;
         }
 
         // Cross-repo dependency resolution
@@ -181,19 +178,7 @@ impl Ingester {
             .execute(queries::MERGE_CROSS_REPO_DEPENDENCY, &[])
             .await?;
 
-        // Update sync timestamp
-        self.graph
-            .execute(
-                queries::UPDATE_ORG_SYNC_TIME,
-                &[
-                    ("login", self.config.github_org.clone().into()),
-                    (
-                        "last_sync_at",
-                        chrono::Utc::now().to_rfc3339().into(),
-                    ),
-                ],
-            )
-            .await?;
+        self.update_sync_timestamp().await?;
 
         info!(
             "Incremental sync complete: {} repos processed, {} updated",
@@ -206,7 +191,6 @@ impl Ingester {
     /// Sync a single repository by name.
     pub async fn sync_repo_by_name(&self, repo_name: &str) -> Result<()> {
         info!("Single repo sync for {repo_name}");
-        // Paginate until we find the target repo
         let mut page = 1u32;
         loop {
             let repos = self.github.list_repos(page, 100).await?;
@@ -224,14 +208,24 @@ impl Ingester {
             }
             page += 1;
         }
-        anyhow::bail!("Repository {repo_name} not found in org");
+        anyhow::bail!("Repository {repo_name} not found in org {}", self.org_config.org);
+    }
+
+    async fn update_sync_timestamp(&self) -> Result<()> {
+        self.graph
+            .execute(
+                queries::UPDATE_ORG_SYNC_TIME,
+                &[
+                    ("login", self.org_config.org.clone().into()),
+                    ("last_sync_at", chrono::Utc::now().to_rfc3339().into()),
+                ],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn sync_single_repo(&self, repo: &octocrab::models::Repository) -> Result<()> {
-        let full_name = repo
-            .full_name
-            .as_deref()
-            .unwrap_or(&repo.name);
+        let full_name = repo.full_name.as_deref().unwrap_or(&repo.name);
         let repo_name = &repo.name;
 
         info!("Syncing repo: {full_name}");
@@ -249,10 +243,7 @@ impl Ingester {
                     ),
                     (
                         "default_branch",
-                        repo.default_branch
-                            .as_deref()
-                            .unwrap_or("main")
-                            .into(),
+                        repo.default_branch.as_deref().unwrap_or("main").into(),
                     ),
                     (
                         "is_archived",
@@ -261,9 +252,7 @@ impl Ingester {
                     ("is_fork", FalkorParam::Bool(repo.fork.unwrap_or(false))),
                     (
                         "stars",
-                        FalkorParam::Int(
-                            repo.stargazers_count.unwrap_or(0) as i64,
-                        ),
+                        FalkorParam::Int(repo.stargazers_count.unwrap_or(0) as i64),
                     ),
                     (
                         "updated_at",
@@ -289,7 +278,7 @@ impl Ingester {
             .execute(
                 queries::MERGE_ORG_HAS_REPO,
                 &[
-                    ("org_login", self.config.github_org.clone().into()),
+                    ("org_login", self.org_config.org.clone().into()),
                     ("repo_full_name", full_name.into()),
                 ],
             )
@@ -336,7 +325,7 @@ impl Ingester {
                             ("repo_full_name", full_name.into()),
                             ("team_slug", team.slug.as_str().into()),
                             ("team_name", team.name.as_str().into()),
-                            ("permission", "read".into()), // default
+                            ("permission", "read".into()),
                         ],
                     )
                     .await?;
@@ -344,23 +333,17 @@ impl Ingester {
         }
 
         // File tree + manifest parsing
-        let default_branch = repo
-            .default_branch
-            .as_deref()
-            .unwrap_or("main");
+        let default_branch = repo.default_branch.as_deref().unwrap_or("main");
 
         if let Ok(tree) = self.github.get_tree(repo_name, default_branch).await {
-            let max_depth = self.config.max_file_depth;
-
             for entry in &tree {
                 let depth = entry.path.matches('/').count();
-                if depth > max_depth {
+                if depth > self.max_file_depth {
                     continue;
                 }
 
                 let kind = FileKind::from_path(&entry.path);
 
-                // Only index key files
                 match kind {
                     FileKind::Other | FileKind::Source => continue,
                     _ => {}
@@ -377,7 +360,6 @@ impl Ingester {
                     )
                     .await?;
 
-                // Parse manifests for dependencies
                 if matches!(kind, FileKind::Manifest) {
                     if let Ok(content) = self
                         .github

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::auth::token_store::TokenStore;
 use crate::config::AppConfig;
 use crate::github::client::GitHubClient;
-use crate::github::ingest::Ingester;
+use crate::github::ingest::{Ingester, SyncReport};
 use crate::graph::client::GraphClient;
 use crate::tools::{explore, search};
 
@@ -36,17 +36,41 @@ impl CodeMemoryServer {
         }
     }
 
-    fn ingester(&self) -> Result<Ingester, ErrorData> {
-        let token_info = self.token_store.get_any_valid()
-            .ok_or_else(|| ErrorData::internal_error(
-                "No valid GitHub token found. Please re-authenticate.".to_string(),
-                None,
-            ))?;
-        let github = Arc::new(
-            GitHubClient::new(&self.config, &token_info.github_token)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
-        );
-        Ok(Ingester::new(github, self.graph.clone(), self.config.clone()))
+    /// Create an Ingester for each configured org.
+    fn ingesters(&self) -> Result<Vec<Ingester>, ErrorData> {
+        let token_info = self.token_store.get_any_valid().ok_or_else(|| {
+            let msg = if self.config.auth_mode == crate::config::AuthMode::GhCli {
+                "GitHub CLI token expired. Restart the server to refresh."
+            } else {
+                "No valid GitHub token found. Please re-authenticate."
+            };
+            ErrorData::internal_error(msg.to_string(), None)
+        })?;
+
+        let mut ingesters = Vec::new();
+        for org_config in &self.config.orgs {
+            // In gh_cli mode with multiple hostnames, look up the per-hostname token
+            let token = if self.config.auth_mode == crate::config::AuthMode::GhCli {
+                self.token_store
+                    .get_by_hostname(&org_config.hostname)
+                    .map(|t| t.github_token.clone())
+                    .unwrap_or_else(|| token_info.github_token.clone())
+            } else {
+                token_info.github_token.clone()
+            };
+
+            let github = Arc::new(
+                GitHubClient::new(org_config, &token)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+            );
+            ingesters.push(Ingester::new(
+                github,
+                self.graph.clone(),
+                org_config.clone(),
+                self.config.max_file_depth,
+            ));
+        }
+        Ok(ingesters)
     }
 }
 
@@ -196,7 +220,7 @@ impl CodeMemoryServer {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[rmcp::tool(description = "List all programming languages used across the organization with repo counts")]
+    #[rmcp::tool(description = "List all programming languages used across all organizations with repo counts")]
     async fn list_languages(&self) -> Result<CallToolResult, ErrorData> {
         let result = explore::list_languages(&self.graph)
             .await
@@ -212,45 +236,68 @@ impl CodeMemoryServer {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[rmcp::tool(description = "Get organization summary statistics: total repos, languages, dependencies, teams")]
+    #[rmcp::tool(description = "Get organization summary statistics: total repos, languages, dependencies, teams. Reports across all configured orgs.")]
     async fn get_org_stats(&self) -> Result<CallToolResult, ErrorData> {
-        let result = explore::get_org_stats(&self.graph, &self.config.github_org)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        let mut results = Vec::new();
+        for org_config in &self.config.orgs {
+            let result = explore::get_org_stats(&self.graph, &org_config.org)
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            results.push(result);
+        }
+        Ok(CallToolResult::success(vec![Content::text(results.join("\n---\n"))]))
     }
 
-    #[rmcp::tool(description = "Sync repos from GitHub into the knowledge graph. Mode: 'full' (re-index everything) or 'incremental' (only changed repos, default)")]
+    #[rmcp::tool(description = "Sync repos from GitHub into the knowledge graph. Syncs all configured organizations. Mode: 'full' (re-index everything) or 'incremental' (only changed repos, default)")]
     async fn sync_org(
         &self,
         Parameters(input): Parameters<SyncOrgInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        let ingester = self.ingester()?;
-        let report = match input.mode.as_deref().unwrap_or("incremental") {
-            "full" => ingester.full_sync().await,
-            _ => ingester.incremental_sync().await,
-        }
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let ingesters = self.ingesters()?;
+        let mut combined = SyncReport::default();
 
-        let json = serde_json::to_string_pretty(&report)
+        for ingester in &ingesters {
+            let report = match input.mode.as_deref().unwrap_or("incremental") {
+                "full" => ingester.full_sync().await,
+                _ => ingester.incremental_sync().await,
+            }
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+            combined.repos_processed += report.repos_processed;
+            combined.repos_updated += report.repos_updated;
+            combined.languages_found += report.languages_found;
+            combined.dependencies_found += report.dependencies_found;
+            combined.errors.extend(report.errors);
+        }
+
+        let json = serde_json::to_string_pretty(&combined)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[rmcp::tool(description = "Re-sync a single repository from GitHub")]
+    #[rmcp::tool(description = "Re-sync a single repository from GitHub. Searches across all configured organizations.")]
     async fn sync_repo(
         &self,
         Parameters(input): Parameters<SyncRepoInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        let ingester = self.ingester()?;
-        ingester
-            .sync_repo_by_name(&input.repo)
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Successfully synced repo: {}",
-            input.repo
-        ))]))
+        let ingesters = self.ingesters()?;
+
+        for ingester in &ingesters {
+            match ingester.sync_repo_by_name(&input.repo).await {
+                Ok(_) => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Successfully synced repo: {}",
+                        input.repo
+                    ))]));
+                }
+                Err(_) => continue,
+            }
+        }
+
+        Err(ErrorData::internal_error(
+            format!("Repository {} not found in any configured organization", input.repo),
+            None,
+        ))
     }
 }
 
@@ -260,7 +307,7 @@ impl ServerHandler for CodeMemoryServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
                 "Enterprise code memory graph. Search repos, explore dependencies, \
-                 find related projects across your GitHub organization.",
+                 find related projects across your GitHub organizations.",
             )
     }
 }

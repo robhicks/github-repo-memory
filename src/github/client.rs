@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use tracing::debug;
 
-use crate::config::AppConfig;
+use crate::config::OrgConfig;
 use crate::graph::models::Team;
 
 type Limiter = GovRateLimiter<
@@ -23,11 +23,11 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    pub fn new(config: &AppConfig, token: &str) -> Result<Self> {
+    pub fn new(org_config: &OrgConfig, token: &str) -> Result<Self> {
         let mut builder = Octocrab::builder().personal_token(token.to_string());
 
-        if config.github_api_url != "https://api.github.com" {
-            builder = builder.base_uri(&config.github_api_url)?;
+        if org_config.api_url != "https://api.github.com" {
+            builder = builder.base_uri(&org_config.api_url)?;
         }
 
         let octocrab = builder.build().context("Failed to build GitHub client")?;
@@ -38,7 +38,7 @@ impl GitHubClient {
 
         Ok(Self {
             octocrab,
-            org: config.github_org.clone(),
+            org: org_config.org.clone(),
             rate_limiter,
         })
     }

@@ -10,7 +10,8 @@ An MCP (Model Context Protocol) server written in Rust that builds a knowledge g
 
 ```bash
 cargo build                  # compile
-cargo run                    # start the server (requires env vars and FalkorDB running)
+cargo run                    # start HTTP server (requires env vars and FalkorDB running)
+cargo run -- --stdio         # start in stdio mode (for MCP client config)
 cargo test                   # run all tests
 cargo test --lib parsers     # run only manifest parser tests
 cargo test --lib client      # run only FalkorDB param tests
@@ -21,7 +22,11 @@ cargo test --lib client      # run only FalkorDB param tests
 docker compose up -d
 ```
 
-**Required env vars** (or `.env` file): `ECMEM_GITHUB_CLIENT_ID`, `ECMEM_GITHUB_CLIENT_SECRET`, `ECMEM_GITHUB_REDIRECT_URI`, `ECMEM_GITHUB_ORG`. See `src/config.rs` for all `ECMEM_*` variables and defaults.
+**Required env vars** (or `.env` file): `ECMEM_GITHUB_ORG` (single org) or `ECMEM_GITHUB_ORGS` (multi-org). In `github` auth mode, also `ECMEM_GITHUB_CLIENT_ID`, `ECMEM_GITHUB_CLIENT_SECRET`, `ECMEM_GITHUB_REDIRECT_URI`. See `src/config.rs` for all `ECMEM_*` variables and defaults.
+
+**Multi-org / multi-GHE:** `ECMEM_GITHUB_ORGS=org-a@ghes1.corp.com,org-b@ghes2.corp.com,org-c` — comma-separated, `@hostname` for GHE instances (omit for github.com). In `gh_cli` mode, runs `gh auth token --hostname` per instance.
+
+**Optional:** `ECMEM_REPOS=repo-a,repo-b` (single org) or `ECMEM_REPOS=org-a:repo-1,repo-2;org-b:repo-3` (multi-org) — restrict which repos are synced.
 
 ## Architecture
 
@@ -55,13 +60,50 @@ Repository -[DEPENDS_ON_REPO]-> Repository  (cross-repo, resolved after sync)
 - `tools/explore.rs` — explore_dependency_graph, list_languages, list_teams, get_org_stats
 
 ### Auth (`src/auth/`)
-- MCP-native OAuth 2 flow with RFC 9728/8414 discovery (`.well-known` endpoints)
+- Three auth modes selected via `ECMEM_AUTH_MODE`: `github` (default), `jwt`, or `gh_cli`
+- `github` mode: MCP-native OAuth 2 flow with RFC 9728/8414 discovery (`.well-known` endpoints)
+- `gh_cli` mode: Uses `gh auth token` at startup — no OAuth routes, no auth middleware, no client ID/secret needed. Ideal for local development
 - `github_oauth.rs` — Full OAuth flow: authorize → GitHub callback → token exchange → dynamic client registration
-- `middleware.rs` — Axum middleware that validates Bearer tokens. Supports two modes: `github` (token store lookup) and `jwt` (HS256 validation)
+- `middleware.rs` — Axum middleware that validates Bearer tokens (used in `github` and `jwt` modes only)
 - `token_store.rs` — In-memory token cache with TTL (DashMap-based)
 
-### Routing (`src/main.rs`)
-OAuth routes are unauthenticated. The `/mcp` endpoint is behind `require_auth` middleware. Health check at `/health`.
+### Transport (`src/main.rs`)
+- **HTTP mode** (default): Streamable HTTP at `/mcp`, OAuth routes unauthenticated, health check at `/health`
+- **Stdio mode** (`--stdio`): MCP over stdin/stdout for local MCP clients. No HTTP server, no OAuth routes
+
+MCP client config for stdio mode (single org):
+```json
+{
+  "mcpServers": {
+    "enterprise-code-memory": {
+      "command": "enterprise-code-memory",
+      "args": ["--stdio"],
+      "env": {
+        "ECMEM_AUTH_MODE": "gh_cli",
+        "ECMEM_GITHUB_ORG": "my-org",
+        "ECMEM_REPOS": "repo-a,repo-b"
+      }
+    }
+  }
+}
+```
+
+MCP client config for multiple GitHub Enterprise instances:
+```json
+{
+  "mcpServers": {
+    "enterprise-code-memory": {
+      "command": "enterprise-code-memory",
+      "args": ["--stdio"],
+      "env": {
+        "ECMEM_AUTH_MODE": "gh_cli",
+        "ECMEM_GITHUB_ORGS": "org-a@ghes1.corp.com,org-b@ghes2.corp.com,org-c",
+        "ECMEM_REPOS": "org-a:repo-1,repo-2;org-b:repo-3"
+      }
+    }
+  }
+}
+```
 
 ## Key Patterns
 

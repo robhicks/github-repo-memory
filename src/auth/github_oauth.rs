@@ -254,7 +254,7 @@ pub async fn token(
     let user: GitHubUser = app
         .oauth
         .http_client
-        .get(&format!("{}/user", app.oauth.config.github_api_url))
+        .get(&format!("{}/user", app.oauth.config.orgs.first().map(|o| o.api_url.as_str()).unwrap_or("https://api.github.com")))
         .header("Authorization", format!("Bearer {}", access_token))
         .header("User-Agent", "enterprise-code-memory")
         .send()
