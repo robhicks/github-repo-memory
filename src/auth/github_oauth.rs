@@ -119,11 +119,7 @@ pub async fn authorize(
         "{}?client_id={}&redirect_uri={}&scope={}&state={}",
         app.oauth.config.github_auth_url,
         app.oauth.config.github_client_id,
-        urlencoding::encode(&format!(
-            "{}{}",
-            server_base_url_from_config(&app.oauth.config),
-            "/callback"
-        )),
+        urlencoding::encode(&app.oauth.config.github_redirect_uri),
         params.scope.as_deref().unwrap_or("repo,read:org"),
         urlencoding::encode(&compound_state),
     );

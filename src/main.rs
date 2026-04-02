@@ -24,7 +24,6 @@ use tracing_subscriber::EnvFilter;
 use auth::github_oauth::OAuthState;
 use auth::middleware::{require_auth, AuthState};
 use auth::token_store::TokenStore;
-use github::client::GitHubClient;
 use graph::client::GraphClient;
 use server::CodeMemoryServer;
 
@@ -76,16 +75,14 @@ async fn main() -> Result<()> {
     // --- MCP service ---
     let graph_for_mcp = graph.clone();
     let config_for_mcp = config.clone();
+    let token_store_for_mcp = token_store.clone();
 
     let mcp_service = StreamableHttpService::new(
         move || {
             let graph = graph_for_mcp.clone();
             let config = config_for_mcp.clone();
-            let github = Arc::new(
-                GitHubClient::new(&config, "placeholder")
-                    .expect("Failed to create GitHub client"),
-            );
-            Ok(CodeMemoryServer::new(graph, github, config))
+            let token_store = token_store_for_mcp.clone();
+            Ok(CodeMemoryServer::new(graph, config, token_store))
         },
         LocalSessionManager::default().into(),
         Default::default(),
@@ -104,7 +101,7 @@ async fn main() -> Result<()> {
             get(auth::github_oauth::auth_server_metadata),
         )
         .route("/authorize", get(auth::github_oauth::authorize))
-        .route("/callback", get(auth::github_oauth::callback))
+        .route("/auth/github/callback", get(auth::github_oauth::callback))
         .route("/token", post(auth::github_oauth::token))
         .route("/register", post(auth::github_oauth::register))
         .with_state(app_state);

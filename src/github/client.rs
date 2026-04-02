@@ -47,7 +47,8 @@ impl GitHubClient {
         self.rate_limiter.until_ready().await;
     }
 
-    /// List repositories for the organization, paginated.
+    /// List repositories for the organization (or user), paginated.
+    /// Tries the org endpoint first; falls back to the user endpoint if that fails.
     pub async fn list_repos(
         &self,
         page: u32,
@@ -56,7 +57,8 @@ impl GitHubClient {
         self.rate_limit().await;
         debug!("Listing repos page={page} per_page={per_page}");
 
-        let page = self
+        // Try org endpoint first
+        let org_result = self
             .octocrab
             .orgs(&self.org)
             .list_repos()
@@ -65,10 +67,24 @@ impl GitHubClient {
             .per_page(per_page)
             .page(page)
             .send()
-            .await
-            .context("Failed to list org repos")?;
+            .await;
 
-        Ok(page.items)
+        match org_result {
+            Ok(p) => Ok(p.items),
+            Err(_) => {
+                debug!("Org endpoint failed, falling back to user repos for {}", self.org);
+                self.rate_limit().await;
+                let p: octocrab::Page<octocrab::models::Repository> = self
+                    .octocrab
+                    .get(
+                        format!("/users/{}/repos?sort=updated&direction=desc&per_page={}&page={}", self.org, per_page, page),
+                        None::<&()>,
+                    )
+                    .await
+                    .context("Failed to list repos (tried both org and user endpoints)")?;
+                Ok(p.items)
+            }
+        }
     }
 
     /// Get languages for a repository with byte counts.

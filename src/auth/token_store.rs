@@ -72,6 +72,16 @@ impl TokenStore {
             .insert(state.to_string(), PkceInfo { challenge, method });
     }
 
+    /// Return any valid (non-expired) token from the store.
+    pub fn get_any_valid(&self) -> Option<TokenInfo> {
+        for entry in self.tokens.iter() {
+            if !entry.value().is_expired() {
+                return Some(entry.value().clone());
+            }
+        }
+        None
+    }
+
     /// Remove all expired entries.
     pub fn cleanup_expired(&self) {
         self.tokens.retain(|_, v| !v.is_expired());

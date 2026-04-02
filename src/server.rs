@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::auth::token_store::TokenStore;
 use crate::config::AppConfig;
 use crate::github::client::GitHubClient;
 use crate::github::ingest::Ingester;
@@ -16,31 +17,36 @@ use crate::tools::{explore, search};
 #[derive(Clone)]
 pub struct CodeMemoryServer {
     graph: Arc<GraphClient>,
-    github: Arc<GitHubClient>,
     config: Arc<AppConfig>,
+    token_store: TokenStore,
     tool_router: ToolRouter<Self>,
 }
 
 impl CodeMemoryServer {
     pub fn new(
         graph: Arc<GraphClient>,
-        github: Arc<GitHubClient>,
         config: Arc<AppConfig>,
+        token_store: TokenStore,
     ) -> Self {
         Self {
             graph,
-            github,
             config,
+            token_store,
             tool_router: Self::tool_router(),
         }
     }
 
-    fn ingester(&self) -> Ingester {
-        Ingester::new(
-            self.github.clone(),
-            self.graph.clone(),
-            self.config.clone(),
-        )
+    fn ingester(&self) -> Result<Ingester, ErrorData> {
+        let token_info = self.token_store.get_any_valid()
+            .ok_or_else(|| ErrorData::internal_error(
+                "No valid GitHub token found. Please re-authenticate.".to_string(),
+                None,
+            ))?;
+        let github = Arc::new(
+            GitHubClient::new(&self.config, &token_info.github_token)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?,
+        );
+        Ok(Ingester::new(github, self.graph.clone(), self.config.clone()))
     }
 }
 
@@ -219,7 +225,7 @@ impl CodeMemoryServer {
         &self,
         Parameters(input): Parameters<SyncOrgInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        let ingester = self.ingester();
+        let ingester = self.ingester()?;
         let report = match input.mode.as_deref().unwrap_or("incremental") {
             "full" => ingester.full_sync().await,
             _ => ingester.incremental_sync().await,
@@ -236,7 +242,7 @@ impl CodeMemoryServer {
         &self,
         Parameters(input): Parameters<SyncRepoInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        let ingester = self.ingester();
+        let ingester = self.ingester()?;
         ingester
             .sync_repo_by_name(&input.repo)
             .await
