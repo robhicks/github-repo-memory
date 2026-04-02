@@ -1,4 +1,4 @@
-# Enterprise Code Memory
+# GitHub Code Memory
 
 An MCP (Model Context Protocol) server that builds a knowledge graph of your GitHub organization's repositories, dependencies, languages, teams, and topics. It ingests data from the GitHub API into [FalkorDB](https://www.falkordb.com/) and exposes query and exploration tools over MCP's Streamable HTTP transport.
 
