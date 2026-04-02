@@ -168,3 +168,128 @@ fn parse_pep508(spec: &str) -> (String, Option<String>) {
         (trimmed.to_string(), None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_cargo_toml() {
+        let content = r#"
+[package]
+name = "my-app"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[dev-dependencies]
+criterion = "0.5"
+"#;
+        let deps = parse_cargo_toml(content).unwrap();
+        assert_eq!(deps.len(), 4);
+        assert!(deps.iter().any(|d| d.name == "serde" && d.version_spec.as_deref() == Some("1.0")));
+        assert!(deps.iter().any(|d| d.name == "tokio" && d.version_spec.as_deref() == Some("1")));
+        assert!(deps.iter().any(|d| d.name == "criterion"));
+        assert!(deps.iter().all(|d| d.ecosystem == "crates"));
+    }
+
+    #[test]
+    fn test_parse_package_json() {
+        let content = r#"{
+  "name": "my-app",
+  "dependencies": {
+    "express": "^4.18.0",
+    "lodash": "^4.17.21"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  }
+}"#;
+        let deps = parse_package_json(content).unwrap();
+        assert_eq!(deps.len(), 3);
+        assert!(deps.iter().any(|d| d.name == "express" && d.version_spec.as_deref() == Some("^4.18.0")));
+        assert!(deps.iter().any(|d| d.name == "jest"));
+        assert!(deps.iter().all(|d| d.ecosystem == "npm"));
+    }
+
+    #[test]
+    fn test_parse_go_mod() {
+        let content = r#"module github.com/myorg/myapp
+
+go 1.21
+
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/stretchr/testify v1.8.4
+)
+
+require github.com/single/dep v0.1.0
+"#;
+        let deps = parse_go_mod(content).unwrap();
+        assert_eq!(deps.len(), 3);
+        assert!(deps.iter().any(|d| d.name == "github.com/gin-gonic/gin" && d.version_spec.as_deref() == Some("v1.9.1")));
+        assert!(deps.iter().any(|d| d.name == "github.com/single/dep"));
+        assert!(deps.iter().all(|d| d.ecosystem == "go"));
+    }
+
+    #[test]
+    fn test_parse_requirements_txt() {
+        let content = r#"
+# This is a comment
+flask==2.3.0
+requests>=2.28.0
+numpy
+-e git+https://github.com/something
+pandas~=1.5
+"#;
+        let deps = parse_requirements_txt(content).unwrap();
+        assert_eq!(deps.len(), 4);
+        assert!(deps.iter().any(|d| d.name == "flask" && d.version_spec.as_deref() == Some("==2.3.0")));
+        assert!(deps.iter().any(|d| d.name == "requests" && d.version_spec.as_deref() == Some(">=2.28.0")));
+        assert!(deps.iter().any(|d| d.name == "numpy" && d.version_spec.is_none()));
+        assert!(deps.iter().any(|d| d.name == "pandas"));
+        assert!(deps.iter().all(|d| d.ecosystem == "pypi"));
+    }
+
+    #[test]
+    fn test_parse_pyproject_toml() {
+        let content = r#"
+[project]
+name = "my-project"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]",
+    "pydantic",
+]
+"#;
+        let deps = parse_pyproject_toml(content).unwrap();
+        assert_eq!(deps.len(), 3);
+        assert!(deps.iter().any(|d| d.name == "fastapi" && d.version_spec.is_some()));
+        assert!(deps.iter().any(|d| d.name == "uvicorn" && d.version_spec.as_deref() == Some("[standard]")));
+        assert!(deps.iter().any(|d| d.name == "pydantic" && d.version_spec.is_none()));
+    }
+
+    #[test]
+    fn test_parse_manifest_dispatch() {
+        let cargo = parse_manifest("Cargo.toml", "[dependencies]\nserde = \"1\"").unwrap();
+        assert_eq!(cargo.len(), 1);
+        assert_eq!(cargo[0].ecosystem, "crates");
+
+        let npm = parse_manifest("package.json", r#"{"dependencies":{"a":"1"}}"#).unwrap();
+        assert_eq!(npm.len(), 1);
+        assert_eq!(npm[0].ecosystem, "npm");
+
+        let unknown = parse_manifest("Makefile", "something").unwrap();
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pep508() {
+        assert_eq!(parse_pep508("flask>=2.0"), ("flask".to_string(), Some(">=2.0".to_string())));
+        assert_eq!(parse_pep508("numpy"), ("numpy".to_string(), None));
+        assert_eq!(parse_pep508("uvicorn[standard]"), ("uvicorn".to_string(), Some("[standard]".to_string())));
+    }
+}

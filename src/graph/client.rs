@@ -3,7 +3,7 @@ use falkordb::FalkorClientBuilder;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::config::AppConfig;
 
@@ -55,8 +55,11 @@ impl GraphClient {
     }
 
     /// Execute a Cypher query with parameters.
-    /// All parameter values are converted to strings since FalkorDB's
-    /// with_params API accepts HashMap<String, String>.
+    ///
+    /// FalkorDB's `with_params` uses the CYPHER parameter prefix format:
+    /// `CYPHER key=value key2='string value' <query>`
+    ///
+    /// String values are single-quoted, integers and booleans are bare.
     pub async fn execute(
         &self,
         query: &str,
@@ -66,8 +69,10 @@ impl GraphClient {
 
         let param_map: HashMap<String, String> = params
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_cypher_string()))
+            .map(|(k, v)| (k.to_string(), v.to_cypher_param()))
             .collect();
+
+        debug!(query = query, params = ?param_map, "Executing Cypher query");
 
         let result = if param_map.is_empty() {
             graph.query(query).execute().await
@@ -77,14 +82,27 @@ impl GraphClient {
 
         let query_result = result.context("FalkorDB query failed")?;
 
-        // Collect result data into a string representation
+        // Format result rows
         let mut output = Vec::new();
         for row in query_result.data {
             output.push(format!("{:?}", row));
         }
 
-        if !query_result.stats.is_empty() {
-            output.push(format!("Stats: {:?}", query_result.stats));
+        if output.is_empty() {
+            // Still include stats for write operations
+            if !query_result.stats.is_empty() {
+                let stats: Vec<String> = query_result
+                    .stats
+                    .iter()
+                    .filter(|s| !s.contains("0 ")) // skip zero stats
+                    .cloned()
+                    .collect();
+                if stats.is_empty() {
+                    return Ok("Operation completed (no changes).".to_string());
+                }
+                return Ok(format!("Operation completed. {}", stats.join(", ")));
+            }
+            return Ok("No results found.".to_string());
         }
 
         Ok(output.join("\n"))
@@ -92,8 +110,11 @@ impl GraphClient {
 }
 
 /// Parameter types supported by FalkorDB queries.
-/// FalkorDB's Rust client only accepts HashMap<String, String> for params,
-/// so we serialize values into Cypher-compatible string representations.
+///
+/// FalkorDB's CYPHER prefix format requires:
+/// - Strings: single-quoted with escaped single quotes
+/// - Integers: bare numeric values
+/// - Booleans: `true` or `false`
 #[derive(Debug, Clone)]
 pub enum FalkorParam {
     String(String),
@@ -102,10 +123,17 @@ pub enum FalkorParam {
 }
 
 impl FalkorParam {
-    /// Convert to a Cypher-compatible string representation.
-    pub fn to_cypher_string(&self) -> String {
+    /// Convert to FalkorDB CYPHER parameter format.
+    ///
+    /// Strings are single-quoted: `'hello'`
+    /// Strings with single quotes are escaped: `'it\\'s'`
+    /// Integers and booleans are bare: `42`, `true`
+    pub fn to_cypher_param(&self) -> String {
         match self {
-            FalkorParam::String(s) => s.clone(),
+            FalkorParam::String(s) => {
+                let escaped = s.replace('\\', "\\\\").replace('\'', "\\'");
+                format!("'{escaped}'")
+            }
             FalkorParam::Int(i) => i.to_string(),
             FalkorParam::Bool(b) => b.to_string(),
         }
@@ -133,5 +161,52 @@ impl From<i64> for FalkorParam {
 impl From<bool> for FalkorParam {
     fn from(b: bool) -> Self {
         FalkorParam::Bool(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_string_param_quoting() {
+        let param = FalkorParam::String("hello world".to_string());
+        assert_eq!(param.to_cypher_param(), "'hello world'");
+    }
+
+    #[test]
+    fn test_string_param_escaping() {
+        let param = FalkorParam::String("it's a test".to_string());
+        assert_eq!(param.to_cypher_param(), "'it\\'s a test'");
+    }
+
+    #[test]
+    fn test_int_param() {
+        let param = FalkorParam::Int(42);
+        assert_eq!(param.to_cypher_param(), "42");
+    }
+
+    #[test]
+    fn test_bool_param() {
+        let param = FalkorParam::Bool(true);
+        assert_eq!(param.to_cypher_param(), "true");
+
+        let param = FalkorParam::Bool(false);
+        assert_eq!(param.to_cypher_param(), "false");
+    }
+
+    #[test]
+    fn test_from_conversions() {
+        let p: FalkorParam = "test".into();
+        assert!(matches!(p, FalkorParam::String(s) if s == "test"));
+
+        let p: FalkorParam = String::from("test").into();
+        assert!(matches!(p, FalkorParam::String(s) if s == "test"));
+
+        let p: FalkorParam = 42i64.into();
+        assert!(matches!(p, FalkorParam::Int(42)));
+
+        let p: FalkorParam = true.into();
+        assert!(matches!(p, FalkorParam::Bool(true)));
     }
 }

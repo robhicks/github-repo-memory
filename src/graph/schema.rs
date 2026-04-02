@@ -14,7 +14,10 @@ pub async fn ensure_schema(client: &GraphClient) -> Result<()> {
             Err(e) => {
                 // Index may already exist — that's fine
                 let msg = e.to_string();
-                if msg.contains("already exists") || msg.contains("Already indexed") {
+                if msg.contains("already exists")
+                    || msg.contains("Already indexed")
+                    || msg.contains("already indexed")
+                {
                     tracing::debug!("Index already exists, skipping: {query}");
                 } else {
                     tracing::warn!("Failed to create index (continuing): {e}");
