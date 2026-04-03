@@ -68,7 +68,11 @@ impl Ingester {
             info!("Syncing {} specified repos", self.org_config.repos.len());
             for repo_name in &self.org_config.repos {
                 match self.sync_repo_by_name(repo_name).await {
-                    Ok(_) => report.repos_updated += 1,
+                    Ok((langs, deps)) => {
+                        report.repos_updated += 1;
+                        report.languages_found += langs;
+                        report.dependencies_found += deps;
+                    }
                     Err(e) => {
                         warn!("Failed to sync repo {repo_name}: {e}");
                         report.errors.push(format!("{repo_name}: {e}"));
@@ -86,7 +90,11 @@ impl Ingester {
                 for repo in &repos {
                     let repo_name = repo.name.clone();
                     match self.sync_single_repo(repo).await {
-                        Ok(_) => report.repos_updated += 1,
+                        Ok((langs, deps)) => {
+                            report.repos_updated += 1;
+                            report.languages_found += langs;
+                            report.dependencies_found += deps;
+                        }
                         Err(e) => {
                             warn!("Failed to sync repo {repo_name}: {e}");
                             report.errors.push(format!("{repo_name}: {e}"));
@@ -140,7 +148,11 @@ impl Ingester {
             info!("Incremental syncing {} specified repos", self.org_config.repos.len());
             for repo_name in &self.org_config.repos {
                 match self.sync_repo_by_name(repo_name).await {
-                    Ok(_) => report.repos_updated += 1,
+                    Ok((langs, deps)) => {
+                        report.repos_updated += 1;
+                        report.languages_found += langs;
+                        report.dependencies_found += deps;
+                    }
                     Err(e) => {
                         warn!("Failed to sync repo {repo_name}: {e}");
                         report.errors.push(format!("{repo_name}: {e}"));
@@ -158,7 +170,11 @@ impl Ingester {
                 for repo in &repos {
                     let repo_name = repo.name.clone();
                     match self.sync_single_repo(repo).await {
-                        Ok(_) => report.repos_updated += 1,
+                        Ok((langs, deps)) => {
+                            report.repos_updated += 1;
+                            report.languages_found += langs;
+                            report.dependencies_found += deps;
+                        }
                         Err(e) => {
                             warn!("Failed to sync repo {repo_name}: {e}");
                             report.errors.push(format!("{repo_name}: {e}"));
@@ -188,8 +204,8 @@ impl Ingester {
         Ok(report)
     }
 
-    /// Sync a single repository by name.
-    pub async fn sync_repo_by_name(&self, repo_name: &str) -> Result<()> {
+    /// Sync a single repository by name. Returns (languages_found, dependencies_found).
+    pub async fn sync_repo_by_name(&self, repo_name: &str) -> Result<(usize, usize)> {
         info!("Single repo sync for {repo_name}");
         let mut page = 1u32;
         loop {
@@ -199,8 +215,7 @@ impl Ingester {
             }
             for repo in &repos {
                 if repo.name == repo_name {
-                    self.sync_single_repo(repo).await?;
-                    return Ok(());
+                    return self.sync_single_repo(repo).await;
                 }
             }
             if repos.len() < 100 {
@@ -224,11 +239,14 @@ impl Ingester {
         Ok(())
     }
 
-    async fn sync_single_repo(&self, repo: &octocrab::models::Repository) -> Result<()> {
+    async fn sync_single_repo(&self, repo: &octocrab::models::Repository) -> Result<(usize, usize)> {
         let full_name = repo.full_name.as_deref().unwrap_or(&repo.name);
         let repo_name = &repo.name;
 
         info!("Syncing repo: {full_name}");
+
+        let mut lang_count = 0usize;
+        let mut dep_count = 0usize;
 
         // Merge repository node
         self.graph
@@ -285,19 +303,23 @@ impl Ingester {
             .await?;
 
         // Languages
-        if let Ok(languages) = self.github.get_repo_languages(repo_name).await {
-            for (lang, bytes) in &languages {
-                self.graph
-                    .execute(
-                        queries::MERGE_REPO_USES_LANGUAGE,
-                        &[
-                            ("repo_full_name", full_name.into()),
-                            ("lang_name", lang.as_str().into()),
-                            ("bytes", FalkorParam::Int(*bytes as i64)),
-                        ],
-                    )
-                    .await?;
+        match self.github.get_repo_languages(repo_name).await {
+            Ok(languages) => {
+                for (lang, bytes) in &languages {
+                    self.graph
+                        .execute(
+                            queries::MERGE_REPO_USES_LANGUAGE,
+                            &[
+                                ("repo_full_name", full_name.into()),
+                                ("lang_name", lang.as_str().into()),
+                                ("bytes", FalkorParam::Int(*bytes as i64)),
+                            ],
+                        )
+                        .await?;
+                    lang_count += 1;
+                }
             }
+            Err(e) => warn!("Failed to fetch languages for {repo_name}: {e}"),
         }
 
         // Topics
@@ -361,38 +383,41 @@ impl Ingester {
                     .await?;
 
                 if matches!(kind, FileKind::Manifest) {
-                    if let Ok(content) = self
-                        .github
-                        .get_file_content(repo_name, &entry.path)
-                        .await
-                    {
-                        if let Ok(deps) = parsers::parse_manifest(&entry.path, &content) {
-                            for dep in &deps {
-                                self.graph
-                                    .execute(
-                                        queries::MERGE_DEPENDENCY,
-                                        &[
-                                            ("repo_full_name", full_name.into()),
-                                            ("dep_name", dep.name.as_str().into()),
-                                            ("ecosystem", dep.ecosystem.as_str().into()),
-                                            (
-                                                "version",
-                                                dep.version_spec
-                                                    .as_deref()
-                                                    .unwrap_or("")
-                                                    .into(),
-                                            ),
-                                            ("dev", FalkorParam::Bool(false)),
-                                        ],
-                                    )
-                                    .await?;
+                    match self.github.get_file_content(repo_name, &entry.path).await {
+                        Ok(content) => {
+                            match parsers::parse_manifest(&entry.path, &content) {
+                                Ok(deps) => {
+                                    for dep in &deps {
+                                        self.graph
+                                            .execute(
+                                                queries::MERGE_DEPENDENCY,
+                                                &[
+                                                    ("repo_full_name", full_name.into()),
+                                                    ("dep_name", dep.name.as_str().into()),
+                                                    ("ecosystem", dep.ecosystem.as_str().into()),
+                                                    (
+                                                        "version",
+                                                        dep.version_spec
+                                                            .as_deref()
+                                                            .unwrap_or("")
+                                                            .into(),
+                                                    ),
+                                                    ("dev", FalkorParam::Bool(false)),
+                                                ],
+                                            )
+                                            .await?;
+                                        dep_count += 1;
+                                    }
+                                }
+                                Err(e) => warn!("Failed to parse manifest {}: {e}", entry.path),
                             }
                         }
+                        Err(e) => warn!("Failed to fetch {}: {e}", entry.path),
                     }
                 }
             }
         }
 
-        Ok(())
+        Ok((lang_count, dep_count))
     }
 }

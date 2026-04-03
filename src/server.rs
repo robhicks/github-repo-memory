@@ -284,10 +284,10 @@ impl CodeMemoryServer {
 
         for ingester in &ingesters {
             match ingester.sync_repo_by_name(&input.repo).await {
-                Ok(_) => {
+                Ok((langs, deps)) => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Successfully synced repo: {}",
-                        input.repo
+                        "Successfully synced repo: {} ({} languages, {} dependencies)",
+                        input.repo, langs, deps
                     ))]));
                 }
                 Err(_) => continue,
